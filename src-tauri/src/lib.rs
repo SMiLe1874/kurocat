@@ -3052,41 +3052,58 @@ fn probe_linux_webkitgtk_version() -> Option<(u32, u32, u32)> {
     use std::ffi::{c_char, c_int, c_void};
 
     const RTLD_LAZY: c_int = 0x00001;
+    const RTLD_NOLOAD: c_int = 0x00004; // only bind an already-mapped soname
     extern "C" {
         fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlclose(handle: *mut c_void) -> c_int;
     }
 
     type VersionFn = unsafe extern "C" fn() -> u32;
 
+    unsafe fn read_webkit_version(handle: *mut c_void) -> Option<(u32, u32, u32)> {
+        let maj_sym = dlsym(handle, b"webkit_get_major_version\0".as_ptr() as *const c_char);
+        let min_sym = dlsym(handle, b"webkit_get_minor_version\0".as_ptr() as *const c_char);
+        let mic_sym = dlsym(handle, b"webkit_get_micro_version\0".as_ptr() as *const c_char);
+        if maj_sym.is_null() || min_sym.is_null() || mic_sym.is_null() {
+            return None;
+        }
+        let maj: VersionFn = std::mem::transmute(maj_sym);
+        let min: VersionFn = std::mem::transmute(min_sym);
+        let mic: VersionFn = std::mem::transmute(mic_sym);
+        let v = (maj(), min(), mic());
+        (v.0 > 0).then_some(v)
+    }
+
     unsafe {
-        // First try symbols already linked into the process (RTLD_DEFAULT = NULL on glibc),
-        // then fall back to opening libwebkit2gtk-4.1.so.0 / 4.0.so.37.
-        let mut handles: [*mut c_void; 3] = [std::ptr::null_mut(); 3];
-        let mut count = 1usize; // index 0 = RTLD_DEFAULT (null)
+        // Prefer already-linked symbols (RTLD_DEFAULT = NULL). Tauri links webkit2gtk-4.1
+        // (libsoup-3); eagerly dlopening webkit2gtk-4.0 pulls libsoup-2.4 into the same
+        // process and aborts with "libsoup2 and libsoup3 in the same process".
+        if let Some(v) = read_webkit_version(std::ptr::null_mut()) {
+            return Some(v);
+        }
+
+        // Probe one soname at a time and stop on first hit. Prefer 4.1; only fall back to
+        // 4.0 when 4.1 is absent (legacy hosts that are soup2-only).
         for lib in [
             b"libwebkit2gtk-4.1.so.0\0".as_slice(),
             b"libwebkit2gtk-4.0.so.37\0".as_slice(),
         ] {
-            let h = dlopen(lib.as_ptr() as *const c_char, RTLD_LAZY);
-            if !h.is_null() {
-                handles[count] = h;
-                count += 1;
+            let mut handle = dlopen(lib.as_ptr() as *const c_char, RTLD_LAZY | RTLD_NOLOAD);
+            let mut opened = false;
+            if handle.is_null() {
+                handle = dlopen(lib.as_ptr() as *const c_char, RTLD_LAZY);
+                opened = !handle.is_null();
             }
-        }
-
-        for &h in &handles[..count] {
-            let maj_sym = dlsym(h, b"webkit_get_major_version\0".as_ptr() as *const c_char);
-            let min_sym = dlsym(h, b"webkit_get_minor_version\0".as_ptr() as *const c_char);
-            let mic_sym = dlsym(h, b"webkit_get_micro_version\0".as_ptr() as *const c_char);
-            if !maj_sym.is_null() && !min_sym.is_null() && !mic_sym.is_null() {
-                let maj: VersionFn = std::mem::transmute(maj_sym);
-                let min: VersionFn = std::mem::transmute(min_sym);
-                let mic: VersionFn = std::mem::transmute(mic_sym);
-                let v = (maj(), min(), mic());
-                if v.0 > 0 {
-                    return Some(v);
-                }
+            if handle.is_null() {
+                continue;
+            }
+            let ver = read_webkit_version(handle);
+            if opened {
+                dlclose(handle);
+            }
+            if ver.is_some() {
+                return ver;
             }
         }
     }
@@ -3780,6 +3797,18 @@ mod side_menu_layout_tests {
         // 20% mini scale (~95px tall): clamped at 55% so toast never steals the whole cat
         let lim20 = super::banner_hit_ry_limit(95.0);
         assert!((lim20 - 0.55).abs() < 1e-6);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_webkit_version_probe_avoids_soup2_soup3_conflict() {
+        // Must not abort: eagerly dlopening webkit2gtk-4.0 while 4.1 (soup3) is linked
+        // used to pull libsoup-2.4 and crash before main UI started.
+        let ver = super::probe_linux_webkitgtk_version();
+        assert!(
+            ver.is_some_and(|(maj, _, _)| maj >= 2),
+            "expected a WebKitGTK 2.x version from linked/probed libs, got {ver:?}"
+        );
     }
 
     #[test]
